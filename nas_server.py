@@ -23,6 +23,8 @@ import logging
 import time
 import urlparse
 import BaseHTTPServer
+import SocketServer
+import threading
 import os
 import random
 import traceback
@@ -47,12 +49,15 @@ address = ("127.0.0.1", 9000)
 class NasServer(object):
     def start(self):
         httpd = NasHTTPServer((address[0], address[1]), NasHTTPServerHandler)
+        t = threading.Thread(target=httpd.serve_forever)
+        t.daemon = True
+        t.start()
         logger.log(logging.INFO, "Now listening for connections on %s:%d...", address[0], address[1])
         httpd.serve_forever()
 
-class NasHTTPServer(BaseHTTPServer.HTTPServer):
+class NasHTTPServer(SocketServer.ThreadingMixIn,BaseHTTPServer.HTTPServer):
     def __init__(self, server_address, RequestHandlerClass):
-        self.db = gs_database.GamespyDatabase()
+        #self.db = gs_database.GamespyDatabase()
         BaseHTTPServer.HTTPServer.__init__(self, server_address, RequestHandlerClass)
 
 class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -60,6 +65,9 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         return "Nintendo Wii (http)"
 
     def do_GET(self):
+        self.server = lambda:None
+        self.server.db = gs_database.GamespyDatabase()
+
         try:
             # conntest server
             self.send_response(200)
@@ -72,12 +80,21 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             logger.log(logging.ERROR, "Unknown exception: %s" % traceback.format_exc())
 
     def do_POST(self):
+        self.server = lambda:None
+        self.server.db = gs_database.GamespyDatabase()
+
         try:
             length = int(self.headers['content-length'])
             post = self.str_to_dict(self.rfile.read(length))
+            if self.client_address[0] == '127.0.0.1':
+                client_address = (self.headers.get('x-forwarded-for', self.client_address[0]), self.client_address[1])
+            else:
+                client_address = self.client_address
+
+            post['ipaddr'] = client_address[0]
 
             if self.path == "/ac":
-                logger.log(logging.DEBUG, "Request to %s from %s", self.path, self.client_address)
+                logger.log(logging.DEBUG, "Request to %s from %s", self.path, client_address)
                 logger.log(logging.DEBUG, post)
                 ret = {
                     "datetime": time.strftime("%Y%m%d%H%M%S"),
@@ -90,26 +107,48 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
                 if action == "acctcreate":
                     # TODO: test for duplicate accounts
-                    ret["returncd"] = "002"
+                    if self.server.db.is_banned(post):
+                        logger.log(logging.DEBUG, "acctcreate denied for banned user "+str(post))
+                        ret = {
+                            "datetime": time.strftime("%Y%m%d%H%M%S"),
+                            "returncd": "3913",
+                            "locator": "gamespy.com",
+                            "retry": "1",
+                            "reason": "User banned."
+                        }
+                    else:
+                        ret["returncd"] = "002"
+                        ret['userid'] = self.server.db.get_next_available_userid()
 
-                    logger.log(logging.DEBUG, "acctcreate response to %s", self.client_address)
-                    logger.log(logging.DEBUG, ret)
+                        logger.log(logging.DEBUG, "acctcreate response to %s", client_address)
+                        logger.log(logging.DEBUG, ret)
 
                     ret = self.dict_to_str(ret)
 
                 elif action == "login":
-                    challenge = utils.generate_random_str(8)
-                    post["challenge"] = challenge
-                    authtoken = self.server.db.generate_authtoken(post["userid"], post)
-                    ret.update({
-                        "returncd": "001",
-                        "locator": "gamespy.com",
-                        "challenge": challenge,
-                        "token": authtoken,
-                    })
+                    if self.server.db.is_banned(post):
+                        logger.log(logging.DEBUG, "login denied for banned user "+str(post))
+                        ret = {
+                            "datetime": time.strftime("%Y%m%d%H%M%S"),
+                            "returncd": "3914",
+                            "locator": "gamespy.com",
+                            "retry": "1",
+                            "reason": "User banned."
+                        }
+                    else:
+                        challenge = utils.generate_random_str(8)
+                        post["challenge"] = challenge
+                        
+                        authtoken = self.server.db.generate_authtoken(post["userid"], post)
+                        ret.update({
+                            "returncd": "001",
+                            "locator": "gamespy.com",
+                            "challenge": challenge,
+                            "token": authtoken,
+                        })
 
-                    logger.log(logging.DEBUG, "login response to %s", self.client_address)
-                    logger.log(logging.DEBUG, ret)
+                        logger.log(logging.DEBUG, "login response to %s", client_address)
+                        logger.log(logging.DEBUG, ret)
 
                     ret = self.dict_to_str(ret)
 
@@ -133,16 +172,16 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                             ret["servicetoken"] = authtoken
                             ret["svchost"] = "n/a"
 
-                    logger.log(logging.DEBUG, "svcloc response to %s", self.client_address)
+                    logger.log(logging.DEBUG, "svcloc response to %s", client_address)
                     logger.log(logging.DEBUG, ret)
 
                     ret = self.dict_to_str(ret)
                 else:
-                    logger.log(logging.WARNING, "Unknown action request %s from %s!", self.path, self.client_address)
+                    logger.log(logging.WARNING, "Unknown action request %s from %s!", self.path, client_address)
 
 
             elif self.path == "/pr":
-                logger.log(logging.DEBUG, "Request to %s from %s", self.path, self.client_address)
+                logger.log(logging.DEBUG, "Request to %s from %s", self.path, client_address)
                 logger.log(logging.DEBUG, post)
                 words = len(post["words"].split('\t'))
                 wordsret = "0" * words
@@ -159,13 +198,13 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.send_header("Content-type", "text/plain")
                 self.send_header("NODE", "wifiappe1")
 
-                logger.log(logging.DEBUG, "pr response to %s", self.client_address)
+                logger.log(logging.DEBUG, "pr response to %s", client_address)
                 logger.log(logging.DEBUG, ret)
 
                 ret = self.dict_to_str(ret)
 
             elif self.path == "/download":
-                logger.log(logging.DEBUG, "Request to %s from %s", self.path, self.client_address)
+                logger.log(logging.DEBUG, "Request to %s from %s", self.path, client_address)
                 logger.log(logging.DEBUG, post)
 
                 action = post["action"]
@@ -210,8 +249,14 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         ret = "%d" % count
 
                 if action == "list":
-                    num = int(post["num"])
-                    offset = int(post["offset"])
+                    num = post.get("num", None)
+                    offset = post.get("offset", None)
+
+                    if num != None:
+                        num = int(num)
+
+                    if offset != None:
+                        offset = int(offset)
 
                     attr1 = post.get("attr1", None)
                     attr2 = post.get("attr2", None)
@@ -221,17 +266,18 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         # Look for a list file first.
                         # If the list file exists, send the entire thing back to the client.
                         if os.path.isfile(os.path.join(dlcpath, "_list.txt")):
-                            ret = self.filter_list(safeloadfi("_list.txt"), attr1, attr2, attr3)
-                            
-                            # Don't try to filter any further if the list is empty.
-                            if ret.strip() != "":
-                                # this is super game-specific, but we need to handle gen 5 mystery gifts properly somehow
-                                if post["gamecd"].startswith("IRA") and attr1.startswith("MYSTERY"):
-                                    ret = self.filter_list_g5_mystery_gift(ret, post["rhgamecd"])
-                                    ret = self.filter_list_by_date(ret, post["token"])
-                                
-                                if post["gamecd"] in gamecodes_return_random_file:
-                                    ret = self.filter_list_by_date(ret, post["token"])
+                            if post["gamecd"].startswith("IRA") and attr1.startswith("MYSTERY"):
+                                # Pokemon BW Mystery Gifts, until we have a better solution for that
+                                ret = self.filter_list(safeloadfi("_list.txt"), attr1, attr2, attr3)
+                                ret = self.filter_list_g5_mystery_gift(ret, post["rhgamecd"])
+                                ret = self.filter_list_by_date(ret, post["token"])
+                            elif post["gamecd"] in gamecodes_return_random_file:
+                                # Pokemon Gen 4 Mystery Gifts, same here
+                                ret = self.filter_list(safeloadfi("_list.txt"), attr1, attr2, attr3)
+                                ret = self.filter_list_by_date(ret, post["token"])
+                            else:
+                                # default case for most games
+                                ret = self.filter_list(safeloadfi("_list.txt"), attr1, attr2, attr3, num, offset)
 
                 if action == "contents":
                     # Get only the base filename just in case there is a path involved somewhere in the filename string.
@@ -249,12 +295,14 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
                 self.send_header("X-DLS-Host", "http://127.0.0.1/")
 
-                logger.log(logging.DEBUG, "download response to %s", self.client_address)
+                logger.log(logging.DEBUG, "download response to %s", client_address)
 
                 #if dlc_contenttype == False:
                 #    logger.log(logging.DEBUG, ret)
             else:
-                logger.log(logging.WARNING, "Unknown path request %s from %s!", self.path, self.client_address)
+                self.send_response(404)
+                logger.log(logging.WARNING, "Unknown path request %s from %s!", self.path, client_address)
+                return
 
             self.send_header("Content-Length", str(len(ret)))
             self.end_headers()
@@ -322,8 +370,8 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         samples = random.sample(data.splitlines(), count)
         return '\r\n'.join(samples) + '\r\n'
 
-    def filter_list(self, data, attr1 = None, attr2 = None, attr3 = None):
-        if attr1 == None and attr2 == None and attr3 == None:
+    def filter_list(self, data, attr1 = None, attr2 = None, attr3 = None, num = None, offset = None):
+        if attr1 == None and attr2 == None and attr3 == None and num == None and offset == None:
             # Nothing to filter, just return the input data
             return data
 
@@ -331,6 +379,12 @@ class NasHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         nc = lambda a, b: (a is None or a == b)
         attrs = lambda data: (len(data) == 6 and nc(attr1, data[2]) and nc(attr2, data[3]) and nc(attr3, data[4]))
         output = filter(lambda line: attrs(line.split("\t")), data.splitlines())
+
+        if offset != None:
+            output = output[offset:]
+
+        if num != None:
+            output = output[:num]
 
         # if nothing matches, at least return a newline; Pokemon BW at least expects this and will error without it
         return '\r\n'.join(output) + '\r\n'

@@ -95,27 +95,32 @@ class GamespyDatabase(object):
 
         #self.initialize_database()
 
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        if self.conn != None:
+            self.conn.close()
+            self.conn = None
+
     def initialize_database(self):
         with Transaction(self.conn) as tx:
-            row = tx.queryone("SELECT COUNT(*) FROM sqlite_master WHERE name = 'users' AND type = 'table'")
-            count = int(row[0])
-
             # I highly doubt having everything in a database be of the type TEXT is a good practice,
             # but I'm not good with databases and I'm not 100% positive that, for instance, that all
             # user id's will be ints, or all passwords will be ints, etc, despite not seeing any
             # evidence yet to say otherwise as far as Nintendo DS games go.
 
-            if count < 1:
-                tx.nonquery("CREATE TABLE users (profileid INT, userid TEXT, password TEXT, gsbrcd TEXT, email TEXT, uniquenick TEXT, pid TEXT, lon TEXT, lat TEXT, loc TEXT, firstname TEXT, lastname TEXT, stat TEXT, partnerid TEXT, console INT, csnum TEXT, cfc TEXT, bssid TEXT, devname BLOB, birth TEXT, gameid TEXT, enabled INT, zipcode TEXT, aim TEXT)")
-                tx.nonquery("CREATE TABLE sessions (session TEXT, profileid INT, loginticket TEXT)")
-                tx.nonquery("CREATE TABLE buddies (userProfileId INT, buddyProfileId INT, time INT, status INT, notified INT, gameid TEXT, blocked INT)")
-                tx.nonquery("CREATE TABLE pending_messages (sourceid INT, targetid INT, msg TEXT)")
-                tx.nonquery("CREATE TABLE gamestat_profile (profileid INT, dindex TEXT, ptype TEXT, data TEXT)")
-                tx.nonquery("CREATE UNIQUE INDEX IF NOT EXISTS gamestatprofile_triple ON gamestat_profile (profileid, dindex, ptype)")
-                tx.nonquery("CREATE TABLE gameinfo (profileid INT, dindex TEXT, ptype TEXT, data TEXT)")
-                tx.nonquery("CREATE TABLE nas_logins (userid TEXT, authtoken TEXT, data TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS users (profileid INT, userid TEXT, password TEXT, gsbrcd TEXT, email TEXT, uniquenick TEXT, pid TEXT, lon TEXT, lat TEXT, loc TEXT, firstname TEXT, lastname TEXT, stat TEXT, partnerid TEXT, console INT, csnum TEXT, cfc TEXT, bssid TEXT, devname BLOB, birth TEXT, gameid TEXT, enabled INT, zipcode TEXT, aim TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS sessions (session TEXT, profileid INT, loginticket TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS buddies (userProfileId INT, buddyProfileId INT, time INT, status INT, notified INT, gameid TEXT, blocked INT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS pending_messages (sourceid INT, targetid INT, msg TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS gamestat_profile (profileid INT, dindex TEXT, ptype TEXT, data TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS gameinfo (profileid INT, dindex TEXT, ptype TEXT, data TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS nas_logins (userid TEXT, authtoken TEXT, data TEXT)")
+            tx.nonquery("CREATE TABLE IF NOT EXISTS banned (gameid TEXT, ipaddr TEXT)")
 
             # Create some indexes for performance.
+            tx.nonquery("CREATE UNIQUE INDEX IF NOT EXISTS gamestatprofile_triple on gamestat_profile(profileid,dindex,ptype)")
             tx.nonquery("CREATE UNIQUE INDEX IF NOT EXISTS users_profileid_idx ON users (profileid)")
             tx.nonquery("CREATE INDEX IF NOT EXISTS users_userid_idx ON users (userid)")
             tx.nonquery("CREATE INDEX IF NOT EXISTS pending_messages_targetid_idx ON pending_messages (targetid)")
@@ -161,6 +166,12 @@ class GamespyDatabase(object):
 
         return valid_user
 
+    def check_user_enabled(self, userid, gsbrcd):
+        with Transaction(self.conn) as tx:
+            row = tx.queryone("SELECT enabled FROM users WHERE userid = ? AND gsbrcd = ?", (userid, gsbrcd))
+            enabled = int(row[0])
+        return enabled > 0
+    
     def check_profile_exists(self, profileid):
         with Transaction(self.conn) as tx:
             row = tx.queryone("SELECT COUNT(*) FROM users WHERE profileid = ?", (profileid,))
@@ -198,7 +209,8 @@ class GamespyDatabase(object):
 
         return profileid
 
-    def create_user(self, userid, password, email, uniquenick, gsbrcd, console, csnum, cfc, bssid, devname, birth, gameid):
+    def create_user(self, userid, password, email, uniquenick, gsbrcd, console, csnum, cfc, bssid, devname, birth, gameid, macadr):
+
         if self.check_user_exists(userid, gsbrcd) == 0:
             profileid = self.get_next_free_profileid()
 
@@ -387,6 +399,23 @@ class GamespyDatabase(object):
         else:
             return json.loads(r["data"])
 
+    def is_banned(self,postdata):
+        with Transaction(self.conn) as tx:
+            row = tx.queryone("SELECT COUNT(*) FROM banned WHERE gameid = ? AND ipaddr = ?",(postdata['gamecd'][:-1],postdata['ipaddr']))
+            return int(row[0]) > 0
+
+    def get_next_available_userid(self):
+        with Transaction(self.conn) as tx:
+            row = tx.queryone("SELECT max(userid) AS maxuser FROM users")
+            r = self.get_dict(row)
+        if r == None or r['maxuser'] == None:
+            return '0000000000002'#Because all zeroes means Dolphin. Don't wanna get confused during debugging later.
+        else:
+            userid = str(int(r['maxuser']) + 1)
+            while len(userid) < 13:
+                userid = "0"+userid
+            return userid
+
     def generate_authtoken(self, userid, data):
         # Since the auth token passed back to the game will be random, we can make it small enough that there
         # should never be a crash due to the size of the token.
@@ -503,8 +532,12 @@ class GamespyDatabase(object):
     # Gamestats-related functions
     def pd_insert(self, profileid, dindex, ptype, data):
         with Transaction(self.conn) as tx:
-            tx.nonquery("INSERT OR REPLACE INTO gamestat_profile (profileid, dindex, ptype, data) VALUES(?,?,?,?)", (profileid, dindex, ptype, data))
-            tx.nonquery("UPDATE gamestat_profile SET data = ? WHERE profileid = ? AND dindex = ? AND ptype = ?", (data, profileid, dindex, ptype))
+            row = tx.queryone("SELECT COUNT(*) FROM gamestat_profile WHERE profileid = ? AND dindex = ? AND ptype = ?", (profileid, dindex, ptype))
+            count = int(row[0])
+            if count > 0:
+                tx.nonquery("UPDATE gamestat_profile SET data = ? WHERE profileid = ? AND dindex = ? AND ptype = ?", (data, profileid, dindex, ptype))
+            else:
+                tx.nonquery("INSERT INTO gamestat_profile (profileid, dindex, ptype, data) VALUES(?,?,?,?)", (profileid, dindex, ptype, data))
 
     def pd_get(self, profileid, dindex, ptype):
         with Transaction(self.conn) as tx:

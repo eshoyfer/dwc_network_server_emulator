@@ -26,6 +26,7 @@ from gamespy_server_browser_server import GameSpyServerBrowserServer
 from gamespy_gamestats_server import GameSpyGamestatsServer
 from nas_server import NasServer
 from internal_stats_server import InternalStatsServer
+from admin_page_server import AdminPageServer
 from storage_server import StorageServer
 from gamestats_server_http import GameStatsServer
 
@@ -38,7 +39,9 @@ if __name__ == "__main__":
     # Let database initialize before starting any servers.
     # This fixes any conflicts where two servers find an uninitialized database at the same time and both try to
     # initialize it.
-    gs_database.GamespyDatabase().initialize_database()
+    db = gs_database.GamespyDatabase()
+    db.initialize_database()
+    db.close()
     
     servers = [
         GameSpyBackendServer,
@@ -50,6 +53,7 @@ if __name__ == "__main__":
         GameSpyNatNegServer,
         NasServer,
         InternalStatsServer,
+        AdminPageServer,
         StorageServer,
         GameStatsServer,
     ]
